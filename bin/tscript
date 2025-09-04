@@ -1,0 +1,422 @@
+#!/usr/bin/env python3
+"""
+tscript — lightweight 'script' replacement with per-line timestamps.
+
+Features:
+- Default ISO-8601 with timezone and milliseconds: 2025-08-31T14:03:27.184+02:00
+- Custom format via --ts-format (supports strftime + {ms3} + {tz})
+- --utc for UTC timestamps (Z)
+- --cmd "..." to run a specific command instead of an interactive login shell
+- --no-color to strip ANSI/VT100 sequences from the LOG (terminal display is unchanged)
+- Append with -a
+- Works on Linux and macOS; no external dependencies.
+
+Usage:
+  tscript [options] [outfile]
+
+Examples:
+  tscript                                   # interactive login shell, logs with ISO-8601 millis
+  tscript -a mylog.txt                      # append to existing file
+  tscript --utc mylog.txt                   # UTC timestamps (Z)
+  tscript --ts-format "%F %T.{ms3} {tz}"    # custom format
+  tscript --cmd "ls -la /" cmd.log          # run a one-off command, log then exit
+  tscript --no-color colorless.log          # strip ANSI codes from the log only
+
+
+Known things to enhance:
+- Better handling of terminal modes (e.g., if stdin is not a tty)
+- --raw-copy mode to save an untimestamped raw stream alongside the timestamped log.
+- Better newline handling for partial last line (optional).
+"""
+
+import argparse
+import datetime as _dt
+import os, sys, pty, tty, termios, fcntl, select, errno, re, struct, signal
+
+# NOTE ABOUT CONTROLLING TTY (ssh password prompt issue):
+# Originally, ssh password prompts were not displayed when running inside
+# tscript. The cause: after fork the child had a new session (via setsid or
+# implicit), but the slave side of the pty was not made the controlling
+# terminal. OpenSSH requires a controlling tty for interactive password
+# authentication; without it, it silently falls back and the user only sees
+# permission denied lines. The fix is to ensure the slave pty becomes the
+# controlling terminal in the child before exec. Some Python builds provide
+# os.login_tty (an atomic helper performing setsid + TIOCSCTTY + dup2 on
+# stdin/out/err). On macOS Python 3.9.6 here, os.login_tty is absent, so we
+# fall back to the manual sequence: setsid, ioctl(TIOCSCTTY), dup2.
+
+
+def _setup_child_tty(master_fd: int, slave_fd: int):
+    """Configure controlling TTY + stdio for the child process.
+
+    Tries os.login_tty if available; otherwise performs:
+      - setsid()
+      - ioctl(TIOCSCTTY)
+      - dup2(slave_fd -> 0,1,2)
+    Closes file descriptors as appropriate.
+    """
+    # Optional helper reference (may be None on platforms lacking it)
+    _login_tty = getattr(os, "login_tty", None)
+
+    if _login_tty is not None:
+        try:
+            _login_tty(slave_fd)  # closes slave_fd on success
+            try:
+                os.close(master_fd)
+            except Exception:
+                pass
+            return
+        except Exception:
+            # Fall through to manual path
+            pass
+    # Manual path
+    try:
+        os.setsid()
+    except Exception:
+        pass
+    try:
+        fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
+    except Exception:
+        pass
+    os.close(master_fd)
+    os.dup2(slave_fd, 0)
+    os.dup2(slave_fd, 1)
+    os.dup2(slave_fd, 2)
+    if slave_fd > 2:
+        os.close(slave_fd)
+
+# ---------- timestamp helpers ----------
+
+def _default_filename():
+    return _dt.datetime.now().strftime("session-%Y-%m-%d_%H%M%S.log")
+
+def _now(use_utc: bool) -> _dt.datetime:
+    return _dt.datetime.now(_dt.timezone.utc) if use_utc else _dt.datetime.now().astimezone()
+
+def _tz_colon(dt: _dt.datetime, use_utc: bool) -> str:
+    """Return RFC3339-style timezone: +HH:MM or Z when UTC."""
+    if use_utc:
+        return "Z"
+    off = dt.utcoffset()
+    if off is None:
+        return "+00:00"
+    total = int(off.total_seconds())
+    sign = "+" if total >= 0 else "-"
+    total = abs(total)
+    hh = total // 3600
+    mm = (total % 3600) // 60
+    return f"{sign}{hh:02d}:{mm:02d}"
+
+def _format_ts(dt: _dt.datetime, fmt: str, use_utc: bool) -> str:
+    """strftime with extras: {ms3} for milliseconds and {tz} for RFC3339 offset."""
+    ms3 = f"{dt.microsecond // 1000:03d}"
+    fmt = fmt.replace("{ms3}", ms3).replace("{tz}", _tz_colon(dt, use_utc))
+    return dt.strftime(fmt)
+
+# ---------- terminal helpers ----------
+
+def _set_nonblocking(fd, enable=True):
+    fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+    fcntl.fcntl(fd, fcntl.F_SETFL, (fl | os.O_NONBLOCK) if enable else (fl & ~os.O_NONBLOCK))
+
+def _raw_mode(fd):
+    old = termios.tcgetattr(fd)
+    tty.setraw(fd)
+    return old
+
+def _restore_mode(fd, old):
+    try:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    except termios.error:
+        pass
+
+def _full_write(fd: int, data: bytes):
+    """Write all bytes in data to fd handling partial writes.
+
+    Ensures escape/control sequences are not truncated mid-sequence which can
+    cause stale screen regions in full-screen TUIs (observed with PageUp in vim).
+    """
+    view = memoryview(data)
+    while view:
+        try:
+            written = os.write(fd, view)
+            if written == 0:
+                break
+            view = view[written:]
+        except OSError as e:
+            if e.errno == errno.EINTR:
+                continue
+            if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                # Wait until writable
+                try:
+                    select.select([], [fd], [])
+                except Exception:
+                    pass
+                continue
+            break
+
+# ---------- window size helpers ----------
+
+def _get_winsize(fd):
+    try:
+        packed = fcntl.ioctl(fd, termios.TIOCGWINSZ, b'\x00'*8)
+        rows, cols, hp, wp = struct.unpack('HHHH', packed)
+        if rows == 0 or cols == 0:
+            return 24, 80
+        return rows, cols
+    except Exception:
+        return 24, 80
+
+def _set_winsize(fd, rows, cols):
+    try:
+        packed = struct.pack('HHHH', rows, cols, 0, 0)
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, packed)
+    except Exception:
+        pass
+
+# ---------- ANSI stripping (for --no-color) ----------
+
+# CSI: ESC [ ... [ -~ ]
+_CSI_RE = re.compile(rb'\x1B\[[0-?]*[ -/]*[@-~]')
+# OSC: ESC ] ... (BEL or ST)
+_OSC_RE = re.compile(rb'\x1B\][^\x07\x1B]*(?:\x07|\x1B\\)')
+# Single-char ESC sequences (e.g., ESC 7, ESC 8), and other SS2/SS3
+_SHORT_ESC_RE = re.compile(rb'\x1B[@-Z\\-_]')
+
+def _strip_ansi(data: bytes) -> bytes:
+    data = _OSC_RE.sub(b'', data)
+    data = _CSI_RE.sub(b'', data)
+    data = _SHORT_ESC_RE.sub(b'', data)
+    return data
+
+# ---------- logging ----------
+
+def _write_ts_lines(logf, buffer: bytes, chunk: bytes, fmt: str, use_utc: bool, strip_ansi: bool):
+    """
+    Append chunk to buffer, split by '\n', and write complete lines
+    as: <timestamp> <line>\n
+    """
+    buffer += chunk
+    parts = buffer.split(b"\n")
+    for line in parts[:-1]:
+        if line.endswith(b"\r"):
+            line = line[:-1]
+        if strip_ansi:
+            line = _strip_ansi(line)
+        ts = _format_ts(_now(use_utc), fmt, use_utc)
+        logf.write(f"{ts} ".encode("utf-8") + line + b"\n")
+    logf.flush()
+    return parts[-1]
+
+# ---------- main ----------
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("-a", "--append", action="store_true")
+    ap.add_argument("--utc", action="store_true")
+    ap.add_argument("--no-color", dest="no_color", action="store_true", help="strip ANSI sequences in the log")
+    ap.add_argument("--ts-format", dest="ts_format", default="%Y-%m-%dT%H:%M:%S.{ms3}{tz}")
+    ap.add_argument("--cmd", dest="cmd", help="command to run (uses your $SHELL -lc)")
+    ap.add_argument("outfile", nargs="?")
+    args, rest = ap.parse_known_args()
+    if rest:
+        print(f"Unknown arguments: {' '.join(rest)}", file=sys.stderr)
+        sys.exit(2)
+
+    outpath = args.outfile or _default_filename()
+    mode = "ab" if args.append else "wb"
+    try:
+        logf = open(outpath, mode)
+    except OSError as e:
+        print(f"Cannot open log file '{outpath}': {e}", file=sys.stderr)
+        sys.exit(1)
+
+    shell = os.environ.get("SHELL", "/bin/sh")
+    if args.cmd:
+        print(f"Recording command to {outpath} …")
+    else:
+        print(f"Recording to {outpath} (exit shell or press Ctrl-D to finish)")
+
+    master_fd, slave_fd = pty.openpty()
+
+    # Capture original terminal settings (like script(1) does) to replicate on child side
+    orig_termios = None
+    try:
+        if sys.stdin.isatty():
+            orig_termios = termios.tcgetattr(sys.stdin.fileno())
+    except Exception:
+        orig_termios = None
+
+    # Initial terminal size sync from user's terminal to slave pty (and master)
+    init_rows = init_cols = None
+    if sys.stdin.isatty():
+        init_rows, init_cols = _get_winsize(sys.stdin.fileno())
+        _set_winsize(slave_fd, init_rows, init_cols)
+        # Also apply to master; some terminals behave better when both ends updated
+        try:
+            _set_winsize(master_fd, init_rows, init_cols)
+        except Exception:
+            pass
+
+    pid = os.fork()
+    if pid == 0:
+        _setup_child_tty(master_fd, slave_fd)
+        # Re-apply window size inside child after controlling TTY is set, then signal
+        if init_rows and init_cols:
+            try:
+                _set_winsize(0, init_rows, init_cols)
+            except Exception:
+                pass
+            try:
+                os.kill(os.getpid(), signal.SIGWINCH)
+            except Exception:
+                pass
+        # Apply original termios settings so modes match invoking terminal closely
+        if orig_termios is not None:
+            try:
+                termios.tcsetattr(0, termios.TCSANOW, orig_termios)
+            except Exception:
+                pass
+        if args.cmd:
+            # Run the provided command through the user's shell, login-env + -c
+            os.execvpe(shell, [shell, "-lc", args.cmd], os.environ)
+        else:
+            # Interactive login shell
+            os.execvpe(shell, [shell, "-l"], os.environ)
+    else:
+        try:
+            os.close(slave_fd)
+        except Exception:
+            pass
+
+        stdin_fd = sys.stdin.fileno()
+        old_tty = _raw_mode(stdin_fd)
+        _set_nonblocking(stdin_fd, True)
+        _set_nonblocking(master_fd, True)
+
+        # Track if we've already cleaned up terminal
+        cleaned = False
+
+        def _cleanup(tail_buf_local: bytes):
+            nonlocal cleaned
+            if cleaned:
+                return
+            cleaned = True
+            try:
+                _restore_mode(stdin_fd, old_tty)
+            except Exception:
+                pass
+            try:
+                os.close(master_fd)
+            except Exception:
+                pass
+            if tail_buf_local:
+                line = _strip_ansi(tail_buf_local) if args.no_color else tail_buf_local
+                ts = _format_ts(_now(args.utc), args.ts_format, args.utc)
+                try:
+                    logf.write(f"{ts} ".encode("utf-8") + line + b"\n")
+                except Exception:
+                    pass
+            try:
+                logf.close()
+            except Exception:
+                pass
+
+        # Size propagation
+        def _propagate_size():
+            if sys.stdin.isatty():
+                r, c = _get_winsize(stdin_fd)
+                _set_winsize(master_fd, r, c)
+                try:
+                    os.killpg(pid, signal.SIGWINCH)
+                except Exception:
+                    pass
+
+        def _on_winch(signum, frame):
+            _propagate_size()
+
+        # Forward termination-related signals to child process group
+        def _forward_signal(signum, frame):
+            try:
+                os.killpg(pid, signum)
+            except Exception:
+                pass
+
+        _propagate_size()
+        for sig_to_forward in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            try:
+                signal.signal(sig_to_forward, _forward_signal)
+            except Exception:
+                pass
+        try:
+            signal.signal(signal.SIGWINCH, _on_winch)
+        except Exception:
+            pass
+
+        tail_buf = b""
+        exited = False
+        try:
+            while True:
+                try:
+                    rlist, _, _ = select.select([stdin_fd, master_fd], [], [])
+                except InterruptedError:
+                    continue
+                if stdin_fd in rlist:
+                    try:
+                        data = os.read(stdin_fd, 4096)
+                        if data:
+                            _full_write(master_fd, data)
+                        else:
+                            # stdin EOF -> stop sending input but continue draining child
+                            pass
+                    except OSError as e:
+                        if e.errno not in (errno.EAGAIN, errno.EINTR):
+                            break
+                if master_fd in rlist:
+                    while True:
+                        try:
+                            data = os.read(master_fd, 65536)
+                            if not data:
+                                raise EOFError
+                            _full_write(sys.stdout.fileno(), data)
+                            tail_buf = _write_ts_lines(logf, tail_buf, data, args.ts_format, args.utc, args.no_color)
+                            if len(data) < 65536:
+                                break
+                        except EOFError:
+                            exited = True
+                            break
+                        except OSError as e:
+                            # EIO on PTY master commonly signals EOF when child exits
+                            if e.errno in (errno.EAGAIN, errno.EINTR):
+                                break
+                            if e.errno == errno.EIO:
+                                exited = True
+                                break
+                            break
+                if exited:
+                    break
+        finally:
+            _cleanup(tail_buf)
+
+        # Reap child & exit accordingly
+        try:
+            _, status = os.waitpid(pid, 0)
+        except Exception:
+            print(f"Saved: {outpath} (child wait failed)")
+            sys.exit(1)
+        if os.WIFEXITED(status):
+            code = os.WEXITSTATUS(status)
+            print(f"Saved: {outpath} (child exit {code})")
+            sys.exit(code)
+        if os.WIFSIGNALED(status):
+            sig = os.WTERMSIG(status)
+            print(f"Saved: {outpath} (child killed by signal {sig})")
+            sys.exit(128 + sig)
+        print(f"Saved: {outpath} (child exit unknown)")
+        sys.exit(1)
+
+    # Child never reaches here
+
+if __name__ == "__main__":
+    main()
+
